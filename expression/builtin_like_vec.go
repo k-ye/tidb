@@ -14,8 +14,6 @@
 package expression
 
 import (
-	"regexp"
-
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -35,29 +33,6 @@ func (b *builtinRegexpBinarySig) vectorized() bool {
 
 func (b *builtinRegexpSig) vectorized() bool {
 	return true
-}
-
-func (b *builtinRegexpSharedSig) isMemoizedRegexpInitialized() bool {
-	return !(b.memoizedRegexp == nil && b.memoizedErr == nil)
-}
-
-func (b *builtinRegexpSharedSig) initMemoizedRegexp(patterns *chunk.Column, n int) {
-	// Precondition: patterns is generated from a constant expression
-	for i := 0; i < n; i++ {
-		if patterns.IsNull(i) {
-			continue
-		}
-		re, err := b.compile(patterns.GetString(i))
-		b.memoizedRegexp = re
-		b.memoizedErr = err
-		break
-	}
-	if !b.isMemoizedRegexpInitialized() {
-		b.memoizedErr = errors.New("No valid regexp pattern found")
-	}
-	if b.memoizedErr != nil {
-		b.memoizedRegexp = nil
-	}
 }
 
 func (b *builtinRegexpSharedSig) vecEvalInt(input *chunk.Chunk, result *chunk.Column) error {
@@ -80,14 +55,22 @@ func (b *builtinRegexpSharedSig) vecEvalInt(input *chunk.Chunk, result *chunk.Co
 		return err
 	}
 
-	if b.args[1].ConstItem() && !b.isMemoizedRegexpInitialized() {
-		b.initMemoizedRegexp(bufPat, n)
-	}
-	getRegexp := func(pat string) (*regexp.Regexp, error) {
-		if b.isMemoizedRegexpInitialized() {
-			return b.memoizedRegexp, b.memoizedErr
+	if b.shouldMemoizeRegexp() {
+		found := false
+		for i := 0; i < n; i++ {
+			if bufPat.IsNull(i) {
+				continue
+			}
+			b.initMemoizedRegexp(bufPat.GetString(i))
+			found = true
+			break
 		}
-		return b.compile(pat)
+		if !found {
+			// If the regexp should be memoized, that means the pattern expression is constant.
+			// And if that expression has an error, we mark the memoization attempt as failed
+			// to prevent repeatedly trying to memoize in the future invocations.
+			b.memoizedErr = errors.New("No valid regexp pattern found")
+		}
 	}
 
 	result.ResizeInt64(n, false)
@@ -97,7 +80,7 @@ func (b *builtinRegexpSharedSig) vecEvalInt(input *chunk.Chunk, result *chunk.Co
 		if result.IsNull(i) {
 			continue
 		}
-		re, err := getRegexp(bufPat.GetString(i))
+		re, err := b.getCompiledRegexp(bufPat.GetString(i))
 		if err != nil {
 			return err
 		}

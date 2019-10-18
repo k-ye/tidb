@@ -16,6 +16,7 @@ package expression
 import (
 	"regexp"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -119,6 +120,34 @@ func (b *builtinRegexpSharedSig) clone(from *builtinRegexpSharedSig) {
 	b.memoizedErr = from.memoizedErr
 }
 
+func (b *builtinRegexpSharedSig) isMemoizedRegexpInitialized() bool {
+	return !(b.memoizedRegexp == nil && b.memoizedErr == nil)
+}
+
+func (b *builtinRegexpSharedSig) shouldMemoizeRegexp() bool {
+	return b.args[1].ConstItem() && !b.isMemoizedRegexpInitialized()
+}
+
+func (b *builtinRegexpSharedSig) initMemoizedRegexp(pat string) {
+	// Precondition: pat is from a constant expression
+	re, err := b.compile(pat)
+	b.memoizedRegexp = re
+	b.memoizedErr = err
+	if !b.isMemoizedRegexpInitialized() {
+		b.memoizedErr = errors.New("No valid regexp pattern found")
+	}
+	if b.memoizedErr != nil {
+		b.memoizedRegexp = nil
+	}
+}
+
+func (b *builtinRegexpSharedSig) getCompiledRegexp(pat string) (*regexp.Regexp, error) {
+	if b.isMemoizedRegexpInitialized() {
+		return b.memoizedRegexp, b.memoizedErr
+	}
+	return b.compile(pat)
+}
+
 // evalInt evals `expr REGEXP pat`, or `expr RLIKE pat`.
 // See https://dev.mysql.com/doc/refman/5.7/en/regexp.html#operator_regexp
 func (b *builtinRegexpSharedSig) evalInt(row chunk.Row) (int64, bool, error) {
@@ -132,8 +161,12 @@ func (b *builtinRegexpSharedSig) evalInt(row chunk.Row) (int64, bool, error) {
 		return 0, true, err
 	}
 
+	if b.shouldMemoizeRegexp() {
+		b.initMemoizedRegexp(pat)
+	}
+
 	// TODO: We don't need to compile pattern if it has been compiled or it is static.
-	re, err := b.compile(pat)
+	re, err := b.getCompiledRegexp(pat)
 	if err != nil {
 		return 0, true, ErrRegexp.GenWithStackByArgs(err.Error())
 	}
